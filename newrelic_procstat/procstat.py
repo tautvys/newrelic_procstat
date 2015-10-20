@@ -266,12 +266,12 @@ def main():
                 metrics[key] = value
         process_information = process.cmdline()
         for process_info_item in process_information:
-            if -1 != process_info_item.find('/'):
+            if -1 != process_info_item.find('/config/'):
                 process_information.remove(process_info_item)
         process_name = '|'.join(process_information)
 
         component_template = {
-            "name": "%s-%s-pid:%s" % (gethostname(), process_name, str(pid.pid)),
+            "name": "%s-%s-pid:%s" % (process_name, gethostname(), str(pid.pid)),
             "guid": GUID,
             "duration" : 60,
             "metrics" : metrics       
