@@ -263,9 +263,14 @@ def main():
                 key = "Component/%(section)s/%(namespace)s%(name)s%(unit)s" % locals()
                 value = data.metric
                 metrics[key] = value
+        process_information = process.cmdline()
+        for process_info_item in process_information:
+            if -1 != process_info_item.find('/'):
+                process_information.remove(process_info_item)
+        process_name = '|'.join(process_information)
 
         component_template = {
-            "name": "%s-%s-%s" % (str(pid.pid), pid.name(), gethostname()),
+            "name": "%s-%s-pid:%s" % (gethostname(), process_name, str(pid.pid)),
             "guid": GUID,
             "duration" : 60,
             "metrics" : metrics       
