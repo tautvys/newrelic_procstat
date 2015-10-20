@@ -6,6 +6,7 @@ import requests
 import json
 import subprocess
 import logging
+import time
 from socket import gethostname
 from collections import namedtuple
 from os import getpid
@@ -297,4 +298,6 @@ def main():
 
 #-----------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    while(1):
+        main()
+        time.sleep(60)
