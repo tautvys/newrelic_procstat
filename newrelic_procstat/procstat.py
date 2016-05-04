@@ -6,10 +6,12 @@ import requests
 import json
 import subprocess
 import logging
-import time
+import signal
+
 from socket import gethostname
 from collections import namedtuple
 from os import getpid
+from time import sleep
 
 # TODO: Migrate away from psutil to procfs
 # TODO: Daemonise process
@@ -20,9 +22,6 @@ from os import getpid
 
 URL = "https://platform-api.newrelic.com/platform/v1/metrics"
 GUID = "com.az.procs.procstats"
-LICENSE = ""
-LOG = logging.getLogger(__name__)
-
 
 class metric(object):
     def __init__(self, t_class):
@@ -40,19 +39,28 @@ class metric(object):
         self.metrics.append(datapoint)
 
 #-----------------------------------------------------------------------------------------------------------
-def run_process(cmd):
-    LOG.debug("Running command: %s", cmd)
+def sig_handle(signal, frame):
+    exit(0)
+#-----------------------------------------------------------------------------------------------------------
+def setup_logging():
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    return logger
+#-----------------------------------------------------------------------------------------------------------
+def run_process(logger, cmd):
+    logger.debug("Running command: %s", cmd)
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
     output = process.communicate()[0].split('\n')
     output = [line for line in output if line != '']
-    LOG.debug("Returned raw output of: %s", output)
+    logger.debug("Returned raw output of: %s", output)
 
     return output
 #-----------------------------------------------------------------------------------------------------------
-def get_cpu_stats(process):
+def get_cpu_stats(logger, process):
 
-    LOG.debug("Gathering CPU statistics")
+    logger.debug("Gathering CPU statistics for process %s", process)
     cpustats = metric('cpu')
 
     csw = process.num_ctx_switches()
@@ -72,7 +80,7 @@ def get_cpu_stats(process):
     cmd = ["pidstat", "1", "1", "-p"]
     cmd.append(str(process.pid))
 
-    output = run_process(cmd)
+    output = run_process(logger, cmd)
 
     line_matrix = {}
     for line in output:
@@ -99,12 +107,12 @@ def get_cpu_stats(process):
     return  cpustats
 
 #-----------------------------------------------------------------------------------------------------------
-def get_net_stats(process):
+def get_net_stats(logger, process):
 
     # TODO: bytes in/out per process /proc/<PID>/net/dev
     # TODO: errors in/out per process /proc/<PID>/net/dev
 
-    LOG.debug("Gathering Network statistics")
+    logger.debug("Gathering Network statistics for process %s", process)
     netstats = metric('net')
     current_connections = process.connections()
 
@@ -122,9 +130,9 @@ def get_net_stats(process):
     return netstats
 
 #-----------------------------------------------------------------------------------------------------------
-def get_vm_stats(process):
+def get_vm_stats(logger, process):
 
-    LOG.debug("Gathering Virtual Memory statistics")
+    logger.debug("Gathering Virtual Memory statistics for process %s", process)
     memstats = metric('mem')
 
     memstats.add_metric('percentage', 'percentage_usage', process.memory_percent())
@@ -152,7 +160,7 @@ def get_vm_stats(process):
 
     cmd = ["pidstat", "1", "1", "-r", "-p"]
     cmd.append(str(process.pid))
-    output = run_process(cmd)
+    output = run_process(logger, cmd)
 
     line_matrix = {}
     for line in output:
@@ -181,12 +189,12 @@ def get_vm_stats(process):
     return memstats
 
 #-----------------------------------------------------------------------------------------------------------
-def get_io_stats(process):
+def get_io_stats(logger, process):
 
     # TODO: Add iostat to metrics collect
     #       rrqm/s wrqm/s r/s w/s avgrq-sz avgqu-sz await r_await w_awai
 
-    LOG.debug("Gathering IO statistics")
+    logger.debug("Gathering IO statistics for process %s", process)
     diskstats = metric('disk')
 
     diskstats.add_metric('count', 'fd', process.num_fds())
@@ -201,21 +209,36 @@ def get_io_stats(process):
     return diskstats
 
 #-----------------------------------------------------------------------------------------------------------
-def read_config():
+def read_config(logger):
 
-    with open("config.yml", 'r') as f_yaml:
-        config = yaml.load(f_yaml)
-
-    if 'process' not in config.keys():
-        LOG.error("process stanza does not exist in config file")
+    # TODO: Pass in file path to config file
+    logger.debug('Opening config.yml configuration file')
+    try:
+        with open("config.yml", 'r') as f_yaml:
+            config = yaml.load(f_yaml)
+    except IOError:
+        logger.debug('Unable to find config.yml file')
         exit(1)
 
-    processes = config['process']
+    for key in ['general', 'process']:
+        if key not in config.keys():
+            logger.error("%s stanza does not exist in config file", key)
+            exit(1)
 
-    return processes
+    processes = config['process']
+    license = config['general']['license']
+    duration = int(config['general']['duration'])
+
+    if duration < 60:
+        logger.warning('Duration cannot be less than 60 seconds...setting to 60')
+        duraction = 60
+
+    return processes, license, duration
 
 #-----------------------------------------------------------------------------------------------------------
-def find_pid(processes):
+def find_pid(logger, processes):
+
+    logger.debug('Looking up PIDs')
 
     pids = []
 
@@ -225,6 +248,7 @@ def find_pid(processes):
         if not proc.name() in processes:
             continue
 
+        logger.info('Watching process %s with pid %s', proc.name(), proc)
         pids.append(proc)
 
     return pids
@@ -232,72 +256,68 @@ def find_pid(processes):
 #-----------------------------------------------------------------------------------------------------------
 def main():
     components = []
+    logger = setup_logging()
+    logger.info("Starting procstat" )
 
-    processes = read_config()
-    pids = find_pid(processes)
+    processes, license, duration = read_config(logger)
+    pids = find_pid(logger, processes)
 
-    LOG.info("Watching process:" )
+    while True:
+        for pid in pids:
+            collection = []
+            metrics = dict()
+            process = psutil.Process(pid.pid)
 
-    for pid in pids:
-        collection = []
-        metrics = dict()
-        process = psutil.Process(pid.pid)
-    
-        collection.append(get_cpu_stats(process))
-        collection.append(get_net_stats(process))
-        collection.append(get_vm_stats(process))
-        collection.append(get_io_stats(process))
-    
-        for metric in collection:
-            for data in metric.metrics:
-                namespace = ''
-                unit = ''
-                section = metric.t_class
-                name = data.name
-    
-                if data.namespace:
-                    namespace = data.namespace + "/"
-    
-                if data.unit:
-                    unit = "[" + data.unit + "]"
-    
-                key = "Component/%(section)s/%(namespace)s%(name)s%(unit)s" % locals()
-                value = data.metric
-                metrics[key] = value
-        process_information = process.cmdline()
-        for process_info_item in process_information:
-            if -1 != process_info_item.find('/config/'):
-                process_information.remove(process_info_item)
-        process_name = '|'.join(process_information)
+            collection.append(get_cpu_stats(logger, process))
+            collection.append(get_net_stats(logger, process))
+            collection.append(get_vm_stats(logger, process))
+            collection.append(get_io_stats(logger, process))
 
-        component_template = {
-            "name": "%s-%s-pid:%s" % (process_name, gethostname(), str(pid.pid)),
-            "guid": GUID,
-            "duration" : 60,
-            "metrics" : metrics       
+            for metric in collection:
+                for data in metric.metrics:
+                    namespace = ''
+                    unit = ''
+                    section = metric.t_class
+                    name = data.name
+
+                    if data.namespace:
+                        namespace = data.namespace + "/"
+
+                    if data.unit:
+                        unit = "[" + data.unit + "]"
+
+                    key = "Component/%(section)s/%(namespace)s%(name)s%(unit)s" % locals()
+                    value = data.metric
+                    metrics[key] = value
+
+            component_template = {
+                "name": "%s-%s-%s" % (str(pid.pid), pid.name(), gethostname()),
+                "guid": GUID,
+                "duration": duration,
+                "metrics": metrics
+            }
+
+            components.append(component_template)
+
+        payload = {
+          "agent": {
+            "host" : gethostname(),
+            "pid" : getpid(),
+            "version" : "1.0.0"
+          },
+          "components": components
         }
 
-        components.append(component_template)
-    
-    
-    payload = {
-      "agent": {
-        "host" : gethostname(),
-        "pid" : getpid(),
-        "version" : "1.0.0"
-      },
-      "components": components
-    }
-    
-    LOG.debug("Sending payload\n: %s", payload)
-    
-    headers = {"X-License-Key": LICENSE, "Content-Type":"application/json", "Accept":"application/json"}
-    request = requests.post(url=URL, headers=headers, data=json.dumps(payload))
-    LOG.debug("Newrelic response code: %s" ,request.status_code)
-    print request.text
+        logger.debug("Sending payload to newrelic\n: %s", payload)
+
+        headers = {"X-License-Key": license, "Content-Type":"application/json", "Accept":"application/json"}
+        request = requests.post(url=URL, headers=headers, data=json.dumps(payload))
+        logger.debug("Newrelic response code: %s", request.status_code)
+
+        sleep(duration)
 
 #-----------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    while(1):
-        main()
-        time.sleep(60)
+    signal.signal(signal.SIGINT, sig_handle)
+    signal.signal(signal.SIGTERM, sig_handle)
+    main()

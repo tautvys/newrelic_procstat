@@ -3,8 +3,10 @@
 # process:
 #  nginx
 
+general:
+   license: license_key
+   duration: 60
+
 process:
    nginx
    apache
-   
-   
